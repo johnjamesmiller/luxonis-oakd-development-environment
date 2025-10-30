@@ -2,18 +2,36 @@
 
 import depthai as dai
 import time
+import blobconverter
 
-FLASH = True
+
+FLASH = False
 
 # Start defining a pipeline
 pipeline = dai.Pipeline()
 
 # Define a source - color camera
 cam = pipeline.create(dai.node.ColorCamera)
+cam.setPreviewSize(640, 352)
+cam.setInterleaved(False)
+cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
+
 # VideoEncoder
 jpeg = pipeline.create(dai.node.VideoEncoder)
-jpeg.setDefaultProfilePreset(cam.getFps(), dai.VideoEncoderProperties.Profile.MJPEG)
+fps = cam.getFps()
+print(f'fps from camera: {fps}')
+jpeg.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
 
+detectionNetwork = pipeline.create(dai.node.YoloDetectionNetwork)
+# Network specific settings
+detectionNetwork.setConfidenceThreshold(0.5)
+detectionNetwork.setNumClasses(80)
+detectionNetwork.setCoordinateSize(4)
+detectionNetwork.setIouThreshold(0.5)
+# We have this model on DepthAI Zoo, so download it using blobconverter
+detectionNetwork.setBlobPath(blobconverter.from_zoo('yolov8n_coco_640x352', zoo_type='depthai'))
+detectionNetwork.input.setBlocking(False)
 
 # Script node
 script = pipeline.create(dai.node.Script)
@@ -54,6 +72,19 @@ script.setScript("""
                     timeCounter = time.time()
                     while True:
                         jpegImage = node.io['jpeg'].get()
+                 
+                        detections = node.io["detection_in"].get().detections
+                        node.warn('Received frame + dets')
+                        ts = jpegImage.getTimestamp()
+
+                        det_arr = []
+                        for det in detections:
+                            det_arr.append(f"{det.label};{(det.confidence*100):.1f};{det.xmin:.4f};{det.ymin:.4f};{det.xmax:.4f};{det.ymax:.4f}")
+                        det_str = "|".join(det_arr)
+
+                        header = f"IMG {ts.total_seconds()} {len(det_str)}".ljust(32)
+                        node.warn(f'>{header}<')
+
                         self.wfile.write("--jpgboundary".encode())
                         self.wfile.write(bytes([13, 10]))
                         self.send_header('Content-type', 'image/jpeg')
@@ -76,7 +107,22 @@ script.setScript("""
 """)
 
 # Connections
-cam.video.link(jpeg.input)
+# Feed preview frames into the detection network
+cam.preview.link(detectionNetwork.input)
+
+# The detection network provides a passthrough frame, but the encoder expects NV12/YUV frames.
+# Insert an ImageManip node to convert/resize/frame-type the passthrough into NV12 for the encoder.
+manip = pipeline.create(dai.node.ImageManip)
+manip.initialConfig.setResize(640, 352)
+manip.initialConfig.setKeepAspectRatio(False)
+manip.initialConfig.setFrameType(dai.RawImgFrame.Type.NV12)
+
+# Link passthrough -> manip -> encoder
+detectionNetwork.passthrough.link(manip.inputImage)
+manip.out.link(jpeg.input)
+
+# Also link detections to the script and encoder bitstream to the script
+detectionNetwork.out.link(script.inputs['detection_in'])
 jpeg.bitstream.link(script.inputs['jpeg'])
 
 if FLASH: 
