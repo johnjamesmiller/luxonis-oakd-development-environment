@@ -1,0 +1,15 @@
+FROM luxonis/depthai-library:latest
+
+RUN alias ll='ls -l'
+RUN apt-get update \
+   && apt-get -y install --no-install-recommends vim \
+   #
+   # Clean up
+   && apt-get autoremove -y \
+   && apt-get clean -y \
+   && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+
+RUN pip install --no-cache-dir --upgrade pip \
+  && pip install --no-cache-dir -r requirements.txt
