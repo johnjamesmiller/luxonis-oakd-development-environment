@@ -3,6 +3,8 @@
 import depthai as dai
 import time
 
+FLASH = True
+
 # Start defining a pipeline
 pipeline = dai.Pipeline()
 
@@ -77,16 +79,17 @@ script.setScript("""
 cam.video.link(jpeg.input)
 jpeg.bitstream.link(script.inputs['jpeg'])
 
-# Connect to device with pipeline
-#with dai.Device(pipeline) as device:
-#    while not device.isClosed():
-#        time.sleep(1)
+if FLASH: 
+    # Flash the pipeline
+    (f, bl) = dai.DeviceBootloader.getFirstAvailableDevice()
 
-# Flash the pipeline
-(f, bl) = dai.DeviceBootloader.getFirstAvailableDevice()
+    bootloader = dai.DeviceBootloader(bl)
 
-bootloader = dai.DeviceBootloader(bl)
+    progress = lambda p : print(f'Flashing progress: {p*100:.1f}%')
 
-progress = lambda p : print(f'Flashing progress: {p*100:.1f}%')
-
-bootloader.flash(progress, pipeline)
+    bootloader.flash(progress, pipeline)
+else:
+    # Connect to device with pipeline
+    with dai.Device(pipeline) as device:
+        while not device.isClosed():
+            time.sleep(1)
