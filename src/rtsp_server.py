@@ -1,8 +1,9 @@
 """
 Pure-Python RTSP server
 DepthAI → H.264 → RTP/AVP or RTP/AVP/TCP
-- Drops frames > 60,000 bytes
-- VLC-tested: UDP + --rtsp-tcp
+- Full FU-A fragmentation (RFC 6184)
+- Safe for UDP (MTU) and TCP interleaved (!H limit)
+- VLC-tested: vlc rtsp://IP:8554/stream [--rtsp-tcp]
 """
 
 import sys
@@ -22,6 +23,8 @@ import depthai as dai
 FRAMERATE = 30
 RTP_PAYLOAD_TYPE = 96
 SSRC = 0xDEADBEEF
+MAX_UDP_PAYLOAD = 1400      # Safe MTU
+MAX_TCP_PAYLOAD = 60000     # < 65535 for !H
 # ----------------------------------------------------------------------
 
 
@@ -160,7 +163,7 @@ class RTSPHandler:
             f"t=0 0\r\n"
             f"m=video 0 RTP/AVP {RTP_PAYLOAD_TYPE}\r\n"
             f"a=rtpmap:{RTP_PAYLOAD_TYPE} H264/90000\r\n"
-            f"a=fmtp:{RTP_PAYLOAD_TYPE} profile-level-id=42e01f;packetization-mode=1\r\n"
+            f"a=fmtp:{RTP_PAYLOAD_TYPE} packetization-mode=1;profile-level-id=42e01f\r\n"
             f"a=control:track1\r\n"
         ).encode()
         self._send(200, "OK", {
@@ -199,7 +202,7 @@ class RTSPHandler:
 
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind(('', 0))
-        server_rtp = self.rtp_sock.getsockname()[1]
+        server_rtpeed = self.rtp_sock.getsockname()[1]
 
         self.client_ip = self.sock.getpeername()[0]
         self.session = str(int(time.time() * 1000))
@@ -228,52 +231,96 @@ class RTSPHandler:
         })
 
     # ------------------------------------------------------------------
+    def _send_rtp_packet(self, packet: bytes):
+        """Send via UDP or TCP interleaved."""
+        if self.use_tcp:
+            frame = b"$" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
+            with self.tcp_write_lock:
+                try:
+                    self.sock.sendall(frame)
+                except Exception as e:
+                    print(f"[RTP-TCP] send failed: {e}")
+        else:
+            try:
+                self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
+            except Exception as e:
+                print(f"[RTP-UDP] send failed: {e}")
+
+    # ------------------------------------------------------------------
     def _rtp_sender(self):
         seq = self.current_seq
         timestamp = self.current_timestamp
         clock_rate = 90000
         inc = clock_rate // FRAMERATE
 
-        # Safety: prevent !H overflow in TCP interleaved
-        MAX_RTP_PACKET_SIZE = 60000
-
         while not self.stop_event.is_set():
             try:
-                h264_nal = self.frame_q.get(timeout=0.5)
+                nal = self.frame_q.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            # --- DROP OVERSIZED FRAMES ---
-            if len(h264_nal) > MAX_RTP_PACKET_SIZE:
-                print(f"[RTP] Dropped oversized H.264 NAL: {len(h264_nal)} bytes (> {MAX_RTP_PACKET_SIZE})")
+            if len(nal) == 0:
                 continue
 
-            marker = 1
-            rtp_hdr = struct.pack(
-                "!BBHII",
-                0x80,
-                (marker << 7) | RTP_PAYLOAD_TYPE,
-                seq & 0xFFFF,
-                timestamp,
-                SSRC
-            )
+            # Determine max payload size
+            max_payload = MAX_TCP_PAYLOAD if self.use_tcp else MAX_UDP_PAYLOAD
+            max_payload -= 14  # RTP header (12) + FU-A header (2)
 
-            packet = rtp_hdr + h264_nal
+            # Single NAL Unit Mode (if small)
+            if len(nal) <= max_payload:
+                marker = 1
+                rtp_hdr = struct.pack(
+                    "!BBHII",
+                    0x80,
+                    (marker << 7) | RTP_PAYLOAD_TYPE,
+                    seq & 0xFFFF,
+                    timestamp,
+                    SSRC
+                )
+                packet = rtp_hdr + nal
+                self._send_rtp_packet(packet)
+                #print(f"[RTP] Single NAL → {len(packet)} B | seq={seq}")
+                seq = (seq + 1) & 0xFFFF
+                timestamp = (timestamp + inc) & 0xFFFFFFFF
+                continue
 
-            try:
-                if self.use_tcp:
-                    frame = b"$" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
-                    with self.tcp_write_lock:
-                        self.sock.sendall(frame)
+            # --- FU-A Fragmentation ---
+            nal_header = nal[0]
+            fu_indicator = (nal_header & 0xE0) | 28  # FU-A
+            fu_header_start = 0x80 | (nal_header & 0x1F)
+            fu_header_end = 0x40 | (nal_header & 0x1F)
+
+            offset = 1
+            first = True
+            while offset < len(nal):
+                payload_size = min(max_payload, len(nal) - offset)
+                payload = nal[offset:offset + payload_size]
+
+                if first:
+                    fu_header = fu_header_start
+                    first = False
                 else:
-                    self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
-            except Exception as e:
-                print(f"[RTP] send failed: {e}")
-                break
+                    fu_header = nal_header & 0x1F
+                marker = 1 if (offset + payload_size) >= len(nal) else 0
+                if marker:
+                    fu_header |= 0x40  # End bit
 
-            print(f"[RTP{'-TCP' if self.use_tcp else ''}] → {len(packet)} B | seq={seq}")
+                rtp_hdr = struct.pack(
+                    "!BBHII",
+                    0x80,
+                    (marker << 7) | RTP_PAYLOAD_TYPE,
+                    seq & 0xFFFF,
+                    timestamp,
+                    SSRC
+                )
+                fu_packet = rtp_hdr + bytes([fu_indicator, fu_header]) + payload
+                self._send_rtp_packet(fu_packet)
 
-            seq = (seq + 1) & 0xFFFF
+                print(f"[RTP] FU-A {'S' if fu_header & 0x80 else 'M'}{'E' if marker else ''} → {len(fu_packet)} B | seq={seq}")
+
+                offset += payload_size
+                seq = (seq + 1) & 0xFFFF
+
             timestamp = (timestamp + inc) & 0xFFFFFFFF
 
         self.current_seq = seq
