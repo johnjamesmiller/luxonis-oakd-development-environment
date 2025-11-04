@@ -1,7 +1,8 @@
 """
 Pure-Python RTSP server
-DepthAI → H.264 (hardware encoded) → RTP/AVP or RTP/AVP/TCP
-VLC-tested: vlc rtsp://IP:8554/stream [--rtsp-tcp]
+DepthAI → H.264 → RTP/AVP or RTP/AVP/TCP
+- Drops frames > 60,000 bytes
+- VLC-tested: UDP + --rtsp-tcp
 """
 
 import sys
@@ -19,7 +20,7 @@ import depthai as dai
 # Configuration
 # ----------------------------------------------------------------------
 FRAMERATE = 30
-RTP_PAYLOAD_TYPE = 96          # H.264 (dynamic)
+RTP_PAYLOAD_TYPE = 96
 SSRC = 0xDEADBEEF
 # ----------------------------------------------------------------------
 
@@ -31,7 +32,7 @@ def depthai_h264_producer(frame_q: queue.Queue):
     cam.setFps(FRAMERATE)
     cam.setInterleaved(False)
     cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-    cam.setPreviewSize(640, 360)  # Small enough for smooth streaming
+    cam.setPreviewSize(640, 360)
 
     enc = pipeline.create(dai.node.VideoEncoder)
     enc.setDefaultProfilePreset(FRAMERATE, dai.VideoEncoderProperties.Profile.H264_MAIN)
@@ -44,7 +45,7 @@ def depthai_h264_producer(frame_q: queue.Queue):
 
     with dai.Device(pipeline) as dev:
         q = dev.getOutputQueue("h264", maxSize=30, blocking=False)
-        print(f"[H264] Streaming {640}x{360}@{FRAMERATE}fps")
+        print(f"[H264] Streaming 640x360@{FRAMERATE}fps")
         while True:
             pkt = q.tryGet()
             if pkt is not None:
@@ -151,7 +152,6 @@ class RTSPHandler:
 
     # ------------------------------------------------------------------
     def _describe(self):
-        # SPS/PPS will be sent in-band (H.264 over RTP)
         sdp = (
             f"v=0\r\n"
             f"o=- {int(time.time())} 1 IN IP4 0.0.0.0\r\n"
@@ -172,7 +172,6 @@ class RTSPHandler:
     def _setup(self, hdr: dict):
         trans = hdr.get("Transport", "")
 
-        # --- TCP interleaved ---
         if "RTP/AVP/TCP" in trans or "interleaved=" in trans:
             self.use_tcp = True
             m = re.search(r"interleaved=(\d+)(?:-(\d+))?", trans)
@@ -190,7 +189,6 @@ class RTSPHandler:
             })
             return
 
-        # --- UDP ---
         m = re.search(r"client_port=(\d+)(?:-(\d+))?", trans)
         if not m:
             self._error(400)
@@ -236,16 +234,21 @@ class RTSPHandler:
         clock_rate = 90000
         inc = clock_rate // FRAMERATE
 
+        # Safety: prevent !H overflow in TCP interleaved
+        MAX_RTP_PACKET_SIZE = 60000
+
         while not self.stop_event.is_set():
             try:
                 h264_nal = self.frame_q.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            # Each H.264 NAL unit is sent in one RTP packet
-            # FU-A fragmentation is NOT needed – DepthAI gives small NALs
-            marker = 1  # End of frame (DepthAI sends one NAL per frame)
+            # --- DROP OVERSIZED FRAMES ---
+            if len(h264_nal) > MAX_RTP_PACKET_SIZE:
+                print(f"[RTP] Dropped oversized H.264 NAL: {len(h264_nal)} bytes (> {MAX_RTP_PACKET_SIZE})")
+                continue
 
+            marker = 1
             rtp_hdr = struct.pack(
                 "!BBHII",
                 0x80,
