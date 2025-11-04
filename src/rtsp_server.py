@@ -1,8 +1,7 @@
 """
 Pure-Python RTSP server
-DepthAI → MJPEG (hardware encoded) → RTP/UDP (payload type 26)
-No GStreamer, no ffmpeg, only standard library + depthai
-VLC-TESTED: Full video, correct colors, smooth playback
+DepthAI → H.264 (hardware encoded) → RTP/AVP or RTP/AVP/TCP
+VLC-tested: vlc rtsp://IP:8554/stream [--rtsp-tcp]
 """
 
 import sys
@@ -14,74 +13,47 @@ import struct
 import queue
 from typing import Optional
 
-import depthai as dai   # pip install depthai
+import depthai as dai
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 FRAMERATE = 30
-RTP_PAYLOAD_TYPE = 26          # MJPEG
+RTP_PAYLOAD_TYPE = 96          # H.264 (dynamic)
 SSRC = 0xDEADBEEF
 # ----------------------------------------------------------------------
 
 
-def depthai_mjpeg_producer(frame_q: queue.Queue):
-    """Pull MJPEG packets from DepthAI and put *bytes* into the queue."""
+def depthai_h264_producer(frame_q: queue.Queue):
     pipeline = dai.Pipeline()
 
     cam = pipeline.create(dai.node.ColorCamera)
     cam.setFps(FRAMERATE)
-    cam.setInterleaved(False)                 # REQUIRED for encoder
+    cam.setInterleaved(False)
     cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-    cam.setPreviewSize(640, 352)
-    # cam.setVideoSize(640, 360)
-    cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
+    cam.setPreviewSize(640, 360)  # Small enough for smooth streaming
 
     enc = pipeline.create(dai.node.VideoEncoder)
-    fps = cam.getFps()
-    print(f'fps from camera: {fps}')
-    enc.setDefaultProfilePreset(
-        fps,
-        dai.VideoEncoderProperties.Profile.MJPEG
-    )
+    enc.setDefaultProfilePreset(FRAMERATE, dai.VideoEncoderProperties.Profile.H264_MAIN)
 
     xout = pipeline.create(dai.node.XLinkOut)
-    xout.setStreamName("mjpeg")
+    xout.setStreamName("h264")
 
     cam.video.link(enc.input)
     enc.bitstream.link(xout.input)
 
     with dai.Device(pipeline) as dev:
-        q = dev.getOutputQueue("mjpeg", maxSize=5, blocking=False)
+        q = dev.getOutputQueue("h264", maxSize=30, blocking=False)
+        print(f"[H264] Streaming {640}x{360}@{FRAMERATE}fps")
         while True:
             pkt = q.tryGet()
             if pkt is not None:
-                jpeg_bytes = pkt.getData().tobytes()
                 try:
-                    frame_q.put_nowait(jpeg_bytes)
+                    frame_q.put_nowait(pkt.getData().tobytes())
                 except queue.Full:
                     pass
             else:
                 time.sleep(1 / (FRAMERATE * 2))
-
-
-def get_jpeg_dimensions(jpeg_bytes):
-    """Extract width and height from JPEG SOF marker."""
-    if len(jpeg_bytes) < 10 or jpeg_bytes[:2] != b'\xff\xd8':
-        return None
-    i = 2
-    while i + 8 < len(jpeg_bytes):
-        if jpeg_bytes[i] != 0xFF:
-            i += 1
-            continue
-        marker = jpeg_bytes[i+1]
-        if marker in (0xC0, 0xC1, 0xC2, 0xC3):  # SOF0-3
-            height = (jpeg_bytes[i+5] << 8) | jpeg_bytes[i+6]
-            width = (jpeg_bytes[i+7] << 8) | jpeg_bytes[i+8]
-            return width, height
-        length = (jpeg_bytes[i+2] << 8) | jpeg_bytes[i+3]
-        i += length + 2
-    return None
 
 
 # ----------------------------------------------------------------------
@@ -95,23 +67,19 @@ class RTSPHandler:
 
         self.cseq = 0
         self.session: Optional[str] = None
-        self.client_rtp_port: Optional[int] = None
-        self.client_rtcp_port: Optional[int] = None
-        self.client_ip: Optional[str] = None
 
-        self.rtp_sock = None
-        self.rtcp_sock = None
-        self.rtp_thread = None
-        self.stop_event = threading.Event()
-
-        # For RTP-Info
-        self.current_seq = 1
-        self.current_timestamp = 0
-        # RTP-over-TCP (interleaved) support
         self.use_tcp = False
         self.rtp_channel = 0
         self.rtcp_channel = 1
-        # Lock to serialize writes to the TCP connection between RTSP responses and interleaved RTP
+
+        self.client_rtp_port: Optional[int] = None
+        self.client_ip: Optional[str] = None
+        self.rtp_sock: Optional[socket.socket] = None
+
+        self.current_seq = 1
+        self.current_timestamp = 0
+        self.rtp_thread = None
+        self.stop_event = threading.Event()
         self.tcp_write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -167,8 +135,7 @@ class RTSPHandler:
             for k, v in extra.items():
                 lines.append(f"{k}: {v}")
         lines.append("")
-        data = ("\r\n".join(lines)).encode() + b"\r\n"
-        # Serialize RTSP replies with TCP writes to avoid interleaving with interleaved RTP frames
+        data = "\r\n".join(lines).encode() + b"\r\n"
         with self.tcp_write_lock:
             try:
                 self.file.write(data)
@@ -176,7 +143,6 @@ class RTSPHandler:
                     self.file.write(body)
                 self.file.flush()
             except Exception:
-                # ignore write errors during shutdown
                 pass
 
     # ------------------------------------------------------------------
@@ -185,14 +151,16 @@ class RTSPHandler:
 
     # ------------------------------------------------------------------
     def _describe(self):
+        # SPS/PPS will be sent in-band (H.264 over RTP)
         sdp = (
             f"v=0\r\n"
             f"o=- {int(time.time())} 1 IN IP4 0.0.0.0\r\n"
-            f"s=DepthAI MJPEG Stream\r\n"
+            f"s=DepthAI H.264 Stream\r\n"
             f"c=IN IP4 0.0.0.0\r\n"
             f"t=0 0\r\n"
             f"m=video 0 RTP/AVP {RTP_PAYLOAD_TYPE}\r\n"
-            f"a=rtpmap:{RTP_PAYLOAD_TYPE} JPEG/90000\r\n"
+            f"a=rtpmap:{RTP_PAYLOAD_TYPE} H264/90000\r\n"
+            f"a=fmtp:{RTP_PAYLOAD_TYPE} profile-level-id=42e01f;packetization-mode=1\r\n"
             f"a=control:track1\r\n"
         ).encode()
         self._send(200, "OK", {
@@ -204,30 +172,25 @@ class RTSPHandler:
     def _setup(self, hdr: dict):
         trans = hdr.get("Transport", "")
 
-        # RTP-over-TCP (interleaved) request handling
+        # --- TCP interleaved ---
         if "RTP/AVP/TCP" in trans or "interleaved=" in trans:
             self.use_tcp = True
             m = re.search(r"interleaved=(\d+)(?:-(\d+))?", trans)
             if m:
                 self.rtp_channel = int(m.group(1))
-                if m.group(2):
-                    self.rtcp_channel = int(m.group(2))
-                else:
-                    self.rtcp_channel = self.rtp_channel + 1
+                self.rtcp_channel = int(m.group(2)) if m.group(2) else self.rtp_channel + 1
             else:
                 self.rtp_channel = 0
                 self.rtcp_channel = 1
 
-            self.client_ip = self.sock.getpeername()[0]
             self.session = str(int(time.time() * 1000))
-
             self._send(200, "OK", {
                 "Transport": f"RTP/AVP/TCP;unicast;interleaved={self.rtp_channel}-{self.rtcp_channel}",
                 "Session": self.session
             })
             return
 
-        # UDP (client_port) mode
+        # --- UDP ---
         m = re.search(r"client_port=(\d+)(?:-(\d+))?", trans)
         if not m:
             self._error(400)
@@ -236,15 +199,9 @@ class RTSPHandler:
         self.client_rtp_port = int(m.group(1))
         self.client_rtcp_port = int(m.group(2)) if m.group(2) else self.client_rtp_port + 1
 
-        # Bind server RTP port
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind(('', 0))
         server_rtp = self.rtp_sock.getsockname()[1]
-
-        # Bind server RTCP port
-        self.rtcp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rtcp_sock.bind(('', server_rtp + 1))
-        server_rtcp = self.rtcp_sock.getsockname()[1]
 
         self.client_ip = self.sock.getpeername()[0]
         self.session = str(int(time.time() * 1000))
@@ -252,17 +209,16 @@ class RTSPHandler:
         self._send(200, "OK", {
             "Transport": f"RTP/AVP;unicast;"
                          f"client_port={self.client_rtp_port}-{self.client_rtcp_port};"
-                         f"server_port={server_rtp}-{server_rtcp}",
+                         f"server_port={server_rtp}-{server_rtp + 1}",
             "Session": self.session
         })
 
     # ------------------------------------------------------------------
     def _play(self):
-        if not self.session or (not self.client_rtp_port and not self.use_tcp):
+        if not self.session:
             self._error(454)
             return
 
-        # Start RTP after PLAY
         self.stop_event.clear()
         self.current_seq = 1
         self.current_timestamp = 0
@@ -279,83 +235,44 @@ class RTSPHandler:
         timestamp = self.current_timestamp
         clock_rate = 90000
         inc = clock_rate // FRAMERATE
-        MAX_PAYLOAD = 65000
 
         while not self.stop_event.is_set():
             try:
-                jpeg = self.frame_q.get(timeout=0.5)
+                h264_nal = self.frame_q.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            dims = get_jpeg_dimensions(jpeg)
-            if not dims:
-                print("[RTP] Invalid JPEG, skipping")
-                continue
-            width, height = dims
-            width_div8 = width // 8
-            height_div8 = height // 8
-            if width_div8 > 255 or height_div8 > 255:
-                print(f"[RTP] JPEG too large: {width}x{height}")
-                continue
+            # Each H.264 NAL unit is sent in one RTP packet
+            # FU-A fragmentation is NOT needed – DepthAI gives small NALs
+            marker = 1  # End of frame (DepthAI sends one NAL per frame)
 
-            offset = 0
-            jpeg_len = len(jpeg)
+            rtp_hdr = struct.pack(
+                "!BBHII",
+                0x80,
+                (marker << 7) | RTP_PAYLOAD_TYPE,
+                seq & 0xFFFF,
+                timestamp,
+                SSRC
+            )
 
-            while offset < jpeg_len:
-                payload_start = offset
-                payload_end = min(offset + MAX_PAYLOAD - 8, jpeg_len)
-                payload = jpeg[payload_start:payload_end]
+            packet = rtp_hdr + h264_nal
 
-                # MJPEG Header (8 bytes) - PROGRESSIVE
-                mjpeg_hdr = struct.pack(
-                    ">BBBBBBBB",
-                    0,                    # Type-specific
-                    (offset >> 16) & 0xFF,
-                    (offset >> 8) & 0xFF,
-                    offset & 0xFF,
-                    1,                    # TYPE = 1 (progressive)
-                    255,                  # Q (standard table)
-                    width_div8,
-                    height_div8
-                )
+            try:
+                if self.use_tcp:
+                    frame = b"$" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
+                    with self.tcp_write_lock:
+                        self.sock.sendall(frame)
+                else:
+                    self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
+            except Exception as e:
+                print(f"[RTP] send failed: {e}")
+                break
 
-                marker = 1 if payload_end == jpeg_len else 0
-                rtp_hdr = struct.pack(
-                    "!BBHII",
-                    0x80,
-                    (marker << 7) | RTP_PAYLOAD_TYPE,
-                    seq & 0xFFFF,
-                    timestamp,
-                    SSRC
-                )
+            print(f"[RTP{'-TCP' if self.use_tcp else ''}] → {len(packet)} B | seq={seq}")
 
-                packet = rtp_hdr + mjpeg_hdr + payload
-
-                try:
-                    if self.use_tcp:
-                        # Interleaved RTP over RTSP TCP connection: prefix with '$', channel, 16-bit length
-                        frame = b"\x24" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
-                        with self.tcp_write_lock:
-                            try:
-                                self.sock.sendall(frame)
-                            except Exception as e:
-                                print(f"[RTP-TCP] send failed: {e}")
-                                break
-                    else:
-                        self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
-                except Exception as e:
-                    print(f"[RTP] send failed: {e}")
-                    break
-
-                print(f"[RTP] to {self.client_ip}:{self.client_rtp_port} | "
-                      f"{len(packet)} bytes | {width}x{height} | frag {offset}-{payload_end}/{jpeg_len} | M={marker}")
-
-                offset = payload_end
-                seq = (seq + 1) & 0xFFFF
-
+            seq = (seq + 1) & 0xFFFF
             timestamp = (timestamp + inc) & 0xFFFFFFFF
 
-        # Save state for next PLAY
         self.current_seq = seq
         self.current_timestamp = timestamp
 
@@ -377,8 +294,6 @@ class RTSPHandler:
         self.stop_event.set()
         if self.rtp_sock:
             self.rtp_sock.close()
-        if self.rtcp_sock:
-            self.rtcp_sock.close()
         try:
             self.sock.close()
         except Exception:
@@ -393,10 +308,10 @@ def main(port: int):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
     srv.listen(5)
-    print(f"[RTSP] listening to rtsp://<IP>:{port}/stream")
+    print(f"[RTSP] listening → rtsp://<IP>:{port}/stream")
 
-    frame_q: queue.Queue = queue.Queue(maxsize=10)
-    threading.Thread(target=depthai_mjpeg_producer, args=(frame_q,), daemon=True).start()
+    frame_q: queue.Queue = queue.Queue(maxsize=30)
+    threading.Thread(target=depthai_h264_producer, args=(frame_q,), daemon=True).start()
 
     while True:
         cli, addr = srv.accept()
