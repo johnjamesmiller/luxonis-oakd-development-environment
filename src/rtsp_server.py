@@ -1,9 +1,10 @@
 """
 Pure-Python RTSP server
-DepthAI → H.264 → RTP/AVP or RTP/AVP/TCP
-- Full FU-A fragmentation (RFC 6184)
-- Safe for UDP (MTU) and TCP interleaved (!H limit)
-- TEARDOWN crash fixed
+DepthAI to H.264 to RTP/AVP or RTP/AVP/TCP
+- FU-A fragmentation (RFC 6184)
+- UDP + TCP interleaved
+- No queue, no typing, only allowed modules
+- VLC-tested: vlc rtsp://IP:8554/stream [--rtsp-tcp]
 """
 
 import sys
@@ -12,8 +13,7 @@ import threading
 import time
 import re
 import struct
-import queue
-from typing import Optional
+import os
 
 import depthai as dai
 
@@ -23,12 +23,13 @@ import depthai as dai
 FRAMERATE = 30
 RTP_PAYLOAD_TYPE = 96
 SSRC = 0xDEADBEEF
-MAX_UDP_PAYLOAD = 1400      # Safe MTU
-MAX_TCP_PAYLOAD = 60000     # < 65535 for !H
+MAX_UDP_PAYLOAD = 1400
+MAX_TCP_PAYLOAD = 60000
+MAX_BUFFER_SIZE = 30
 # ----------------------------------------------------------------------
 
 
-def depthai_h264_producer(frame_q: queue.Queue):
+def depthai_h264_producer(frame_buffer, buffer_lock, stop_event):
     pipeline = dai.Pipeline()
 
     cam = pipeline.create(dai.node.ColorCamera)
@@ -48,14 +49,14 @@ def depthai_h264_producer(frame_q: queue.Queue):
 
     with dai.Device(pipeline) as dev:
         q = dev.getOutputQueue("h264", maxSize=30, blocking=False)
-        print(f"[H264] Streaming 640x360@{FRAMERATE}fps")
-        while True:
+        print("[H264] Streaming 640x360@{}fps".format(FRAMERATE))
+        while not stop_event.is_set():
             pkt = q.tryGet()
             if pkt is not None:
-                try:
-                    frame_q.put_nowait(pkt.getData().tobytes())
-                except queue.Full:
-                    pass
+                nal = pkt.getData().tobytes()
+                with buffer_lock:
+                    if len(frame_buffer) < MAX_BUFFER_SIZE:
+                        frame_buffer.append(nal)
             else:
                 time.sleep(1 / (FRAMERATE * 2))
 
@@ -64,29 +65,29 @@ def depthai_h264_producer(frame_q: queue.Queue):
 # RTSP Handler
 # ----------------------------------------------------------------------
 class RTSPHandler:
-    def __init__(self, client_sock: socket.socket, frame_q: queue.Queue):
+    def __init__(self, client_sock, frame_buffer, buffer_lock, stop_event):
         self.sock = client_sock
         self.file = client_sock.makefile("rwb")
-        self.frame_q = frame_q
+        self.frame_buffer = frame_buffer
+        self.buffer_lock = buffer_lock
+        self.stop_event = stop_event
 
         self.cseq = 0
-        self.session: Optional[str] = None
+        self.session = None
 
         self.use_tcp = False
         self.rtp_channel = 0
         self.rtcp_channel = 1
 
-        self.client_rtp_port: Optional[int] = None
-        self.client_ip: Optional[str] = None
-        self.rtp_sock: Optional[socket.socket] = None
+        self.client_rtp_port = None
+        self.client_ip = None
+        self.rtp_sock = None
 
         self.current_seq = 1
         self.current_timestamp = 0
         self.rtp_thread = None
-        self.stop_event = threading.Event()
         self.tcp_write_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
     def run(self):
         try:
             while not self.stop_event.is_set():
@@ -95,17 +96,16 @@ class RTSPHandler:
                     break
                 self._handle_request(line)
         except Exception as e:
-            print(f"[RTSP] error: {e}")
+            print("[RTSP] error:", e)
         finally:
             self.cleanup()
 
-    # ------------------------------------------------------------------
-    def _handle_request(self, first_line: str):
+    def _handle_request(self, first_line):
         parts = first_line.split()
-        if len(parts) < 2:                 # ← need at least method + URL
+        if len(parts) < 2:
             return
         method = parts[0]
-        url = parts[1]                     # ← only two values, no third
+        url = parts[1]
 
         headers = {}
         while True:
@@ -131,14 +131,14 @@ class RTSPHandler:
         else:
             self._error(405)
 
-    # ------------------------------------------------------------------
-    def _send(self, code: int, reason: str, extra: Optional[dict] = None, body: Optional[bytes] = None):
-        lines = [f"RTSP/1.0 {code} {reason}", f"CSeq: {self.cseq}"]
+    def _send(self, code, reason, extra=None, body=None):
+        if extra is None:
+            extra = {}
+        lines = ["RTSP/1.0 {} {}".format(code, reason), "CSeq: {}".format(self.cseq)]
         if self.session:
-            lines.append(f"Session: {self.session}")
-        if extra:
-            for k, v in extra.items():
-                lines.append(f"{k}: {v}")
+            lines.append("Session: {}".format(self.session))
+        for k, v in extra.items():
+            lines.append("{}: {}".format(k, v))
         lines.append("")
         data = "\r\n".join(lines).encode() + b"\r\n"
         with self.tcp_write_lock:
@@ -147,33 +147,30 @@ class RTSPHandler:
                 if body:
                     self.file.write(body)
                 self.file.flush()
-            except Exception:
+            except:
                 pass
 
-    # ------------------------------------------------------------------
     def _options(self):
         self._send(200, "OK", {"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"})
 
-    # ------------------------------------------------------------------
     def _describe(self):
         sdp = (
-            f"v=0\r\n"
-            f"o=- {int(time.time())} 1 IN IP4 0.0.0.0\r\n"
-            f"s=DepthAI H.264 Stream\r\n"
-            f"c=IN IP4 0.0.0.0\r\n"
-            f"t=0 0\r\n"
-            f"m=video 0 RTP/AVP {RTP_PAYLOAD_TYPE}\r\n"
-            f"a=rtpmap:{RTP_PAYLOAD_TYPE} H264/90000\r\n"
-            f"a=fmtp:{RTP_PAYLOAD_TYPE} packetization-mode=1;profile-level-id=42e01f\r\n"
-            f"a=control:track1\r\n"
-        ).encode()
+            "v=0\r\n"
+            "o=- {} 1 IN IP4 0.0.0.0\r\n"
+            "s=DepthAI H.264 Stream\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "t=0 0\r\n"
+            "m=video 0 RTP/AVP {}\r\n"
+            "a=rtpmap:{} H264/90000\r\n"
+            "a=fmtp:{} packetization-mode=1;profile-level-id=42e01f\r\n"
+            "a=control:track1\r\n"
+        ).format(int(time.time()), RTP_PAYLOAD_TYPE, RTP_PAYLOAD_TYPE, RTP_PAYLOAD_TYPE).encode()
         self._send(200, "OK", {
             "Content-Type": "application/sdp",
             "Content-Length": str(len(sdp))
         }, sdp)
 
-    # ------------------------------------------------------------------
-    def _setup(self, hdr: dict):
+    def _setup(self, hdr):
         trans = hdr.get("Transport", "")
 
         if "RTP/AVP/TCP" in trans or "interleaved=" in trans:
@@ -188,7 +185,7 @@ class RTSPHandler:
 
             self.session = str(int(time.time() * 1000))
             self._send(200, "OK", {
-                "Transport": f"RTP/AVP/TCP;unicast;interleaved={self.rtp_channel}-{self.rtcp_channel}",
+                "Transport": "RTP/AVP/TCP;unicast;interleaved={}-{}".format(self.rtp_channel, self.rtcp_channel),
                 "Session": self.session
             })
             return
@@ -209,44 +206,40 @@ class RTSPHandler:
         self.session = str(int(time.time() * 1000))
 
         self._send(200, "OK", {
-            "Transport": f"RTP/AVP;unicast;"
-                         f"client_port={self.client_rtp_port}-{self.client_rtcp_port};"
-                         f"server_port={server_rtp}-{server_rtp + 1}",
+            "Transport": "RTP/AVP;unicast;client_port={}-{};server_port={}-{}".format(
+                self.client_rtp_port, self.client_rtcp_port, server_rtp, server_rtp + 1
+            ),
             "Session": self.session
         })
 
-    # ------------------------------------------------------------------
     def _play(self):
         if not self.session:
             self._error(454)
             return
 
-        self.stop_event.clear()
         self.current_seq = 1
         self.current_timestamp = 0
         self.rtp_thread = threading.Thread(target=self._rtp_sender, daemon=True)
         self.rtp_thread.start()
 
         self._send(200, "OK", {
-            "RTP-Info": f"url=track1;seq={self.current_seq};rtptime={self.current_timestamp}"
+            "RTP-Info": "url=track1;seq={};rtptime={}".format(self.current_seq, self.current_timestamp)
         })
 
-    # ------------------------------------------------------------------
-    def _send_rtp_packet(self, packet: bytes):
+    def _send_rtp_packet(self, packet):
         if self.use_tcp:
             frame = b"$" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
             with self.tcp_write_lock:
                 try:
                     self.sock.sendall(frame)
                 except Exception as e:
-                    print(f"[RTP-TCP] send failed: {e}")
+                    print("[RTP-TCP] send failed:", e)
         else:
             try:
                 self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
             except Exception as e:
-                print(f"[RTP-UDP] send failed: {e}")
+                print("[RTP-UDP] send failed:", e)
 
-    # ------------------------------------------------------------------
     def _rtp_sender(self):
         seq = self.current_seq
         timestamp = self.current_timestamp
@@ -254,40 +247,37 @@ class RTSPHandler:
         inc = clock_rate // FRAMERATE
 
         while not self.stop_event.is_set():
-            try:
-                nal = self.frame_q.get(timeout=0.5)
-            except queue.Empty:
+            nal = None
+            with self.buffer_lock:
+                if self.frame_buffer:
+                    nal = self.frame_buffer.pop(0)
+
+            if nal is None:
+                time.sleep(1 / (FRAMERATE * 2))
                 continue
 
             if len(nal) == 0:
                 continue
 
             max_payload = MAX_TCP_PAYLOAD if self.use_tcp else MAX_UDP_PAYLOAD
-            max_payload -= 14                     # RTP header + FU-A header
+            max_payload -= 14
 
-            # ---- Single NAL Unit Mode (small) ----
+            # Single NAL
             if len(nal) <= max_payload:
                 marker = 1
-                rtp_hdr = struct.pack(
-                    "!BBHII",
-                    0x80,
-                    (marker << 7) | RTP_PAYLOAD_TYPE,
-                    seq & 0xFFFF,
-                    timestamp,
-                    SSRC
-                )
+                rtp_hdr = struct.pack("!BBHII", 0x80, (marker << 7) | RTP_PAYLOAD_TYPE, seq & 0xFFFF, timestamp, SSRC)
                 packet = rtp_hdr + nal
                 self._send_rtp_packet(packet)
-                print(f"[RTP] Single NAL → {len(packet)} B | seq={seq}")
+                print("[RTP] Single NAL to {} B | seq={}".format(len(packet), seq))
                 seq = (seq + 1) & 0xFFFF
                 timestamp = (timestamp + inc) & 0xFFFFFFFF
                 continue
 
-            # ---- FU-A Fragmentation ----
+            # FU-A Fragmentation
             nal_header = nal[0]
-            fu_indicator = (nal_header & 0xE0) | 28          # FU-A
-            fu_header_start = 0x80 | (nal_header & 0x1F)     # S bit
-            fu_header_end   = 0x40 | (nal_header & 0x1F)     # E bit
+            fu_indicator = (nal_header & 0xE0) | 28
+            fu_header_start = 0x80 | (nal_header & 0x1F)
+            fu_header_end   = 0x40 | (nal_header & 0x1F)
 
             offset = 1
             first = True
@@ -295,28 +285,19 @@ class RTSPHandler:
                 payload_size = min(max_payload, len(nal) - offset)
                 payload = nal[offset:offset + payload_size]
 
-                if first:
-                    fu_header = fu_header_start
-                    first = False
-                else:
-                    fu_header = nal_header & 0x1F
-
+                fu_header = fu_header_start if first else (nal_header & 0x1F)
+                first = False
                 marker = 1 if (offset + payload_size) >= len(nal) else 0
                 if marker:
                     fu_header |= 0x40
 
-                rtp_hdr = struct.pack(
-                    "!BBHII",
-                    0x80,
-                    (marker << 7) | RTP_PAYLOAD_TYPE,
-                    seq & 0xFFFF,
-                    timestamp,
-                    SSRC
-                )
+                rtp_hdr = struct.pack("!BBHII", 0x80, (marker << 7) | RTP_PAYLOAD_TYPE, seq & 0xFFFF, timestamp, SSRC)
                 fu_packet = rtp_hdr + bytes([fu_indicator, fu_header]) + payload
                 self._send_rtp_packet(fu_packet)
 
-                print(f"[RTP] FU-A {'S' if fu_header & 0x80 else ''}{'E' if marker else ''} → {len(fu_packet)} B | seq={seq}")
+                s = "S" if fu_header & 0x80 else ""
+                e = "E" if marker else ""
+                print("[RTP] FU-A {}{} to {} B | seq={}".format(s, e, len(fu_packet), seq))
 
                 offset += payload_size
                 seq = (seq + 1) & 0xFFFF
@@ -326,52 +307,61 @@ class RTSPHandler:
         self.current_seq = seq
         self.current_timestamp = timestamp
 
-    # ------------------------------------------------------------------
     def _teardown(self):
-        self.stop_event.set()
         if self.rtp_thread:
             self.rtp_thread.join(timeout=1)
         self._send(200, "OK")
         self.cleanup()
 
-    # ------------------------------------------------------------------
-    def _error(self, code: int):
+    def _error(self, code):
         reasons = {400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 454: "Session Not Found"}
         self._send(code, reasons.get(code, "Error"))
 
-    # ------------------------------------------------------------------
     def cleanup(self):
-        self.stop_event.set()
         if self.rtp_sock:
             self.rtp_sock.close()
         try:
             self.sock.close()
-        except Exception:
+        except:
             pass
 
 
 # ----------------------------------------------------------------------
 # Server bootstrap
 # ----------------------------------------------------------------------
-def main(port: int):
+def main(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
     srv.listen(5)
-    print(f"[RTSP] listening → rtsp://<IP>:{port}/stream")
+    print("[RTSP] listening to rtsp://<IP>:{}".format(port))
 
-    frame_q: queue.Queue = queue.Queue(maxsize=30)
-    threading.Thread(target=depthai_h264_producer, args=(frame_q,), daemon=True).start()
+    frame_buffer = []
+    buffer_lock = threading.Lock()
+    stop_event = threading.Event()
 
-    while True:
-        cli, addr = srv.accept()
-        print(f"[RTSP] client {addr}")
-        h = RTSPHandler(cli, frame_q)
-        threading.Thread(target=h.run, daemon=True).start()
+    producer_thread = threading.Thread(
+        target=depthai_h264_producer,
+        args=(frame_buffer, buffer_lock, stop_event),
+        daemon=True
+    )
+    producer_thread.start()
+
+    try:
+        while True:
+            cli, addr = srv.accept()
+            print("[RTSP] client", addr)
+            h = RTSPHandler(cli, frame_buffer, buffer_lock, stop_event)
+            threading.Thread(target=h.run, daemon=True).start()
+    except KeyboardInterrupt:
+        print("\n[RTSP] Shutting down...")
+    finally:
+        stop_event.set()
+        producer_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <port>")
+        print("Usage: {} <port>".format(sys.argv[0]))
         sys.exit(1)
     main(int(sys.argv[1]))
