@@ -107,6 +107,12 @@ class RTSPHandler:
         # For RTP-Info
         self.current_seq = 1
         self.current_timestamp = 0
+        # RTP-over-TCP (interleaved) support
+        self.use_tcp = False
+        self.rtp_channel = 0
+        self.rtcp_channel = 1
+        # Lock to serialize writes to the TCP connection between RTSP responses and interleaved RTP
+        self.tcp_write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     def run(self):
@@ -161,10 +167,17 @@ class RTSPHandler:
             for k, v in extra.items():
                 lines.append(f"{k}: {v}")
         lines.append("")
-        self.file.write("\r\n".join(lines).encode() + b"\r\n")
-        if body:
-            self.file.write(body)
-        self.file.flush()
+        data = ("\r\n".join(lines)).encode() + b"\r\n"
+        # Serialize RTSP replies with TCP writes to avoid interleaving with interleaved RTP frames
+        with self.tcp_write_lock:
+            try:
+                self.file.write(data)
+                if body:
+                    self.file.write(body)
+                self.file.flush()
+            except Exception:
+                # ignore write errors during shutdown
+                pass
 
     # ------------------------------------------------------------------
     def _options(self):
@@ -190,6 +203,31 @@ class RTSPHandler:
     # ------------------------------------------------------------------
     def _setup(self, hdr: dict):
         trans = hdr.get("Transport", "")
+
+        # RTP-over-TCP (interleaved) request handling
+        if "RTP/AVP/TCP" in trans or "interleaved=" in trans:
+            self.use_tcp = True
+            m = re.search(r"interleaved=(\d+)(?:-(\d+))?", trans)
+            if m:
+                self.rtp_channel = int(m.group(1))
+                if m.group(2):
+                    self.rtcp_channel = int(m.group(2))
+                else:
+                    self.rtcp_channel = self.rtp_channel + 1
+            else:
+                self.rtp_channel = 0
+                self.rtcp_channel = 1
+
+            self.client_ip = self.sock.getpeername()[0]
+            self.session = str(int(time.time() * 1000))
+
+            self._send(200, "OK", {
+                "Transport": f"RTP/AVP/TCP;unicast;interleaved={self.rtp_channel}-{self.rtcp_channel}",
+                "Session": self.session
+            })
+            return
+
+        # UDP (client_port) mode
         m = re.search(r"client_port=(\d+)(?:-(\d+))?", trans)
         if not m:
             self._error(400)
@@ -220,7 +258,7 @@ class RTSPHandler:
 
     # ------------------------------------------------------------------
     def _play(self):
-        if not self.session or not self.client_rtp_port:
+        if not self.session or (not self.client_rtp_port and not self.use_tcp):
             self._error(454)
             return
 
@@ -294,7 +332,17 @@ class RTSPHandler:
                 packet = rtp_hdr + mjpeg_hdr + payload
 
                 try:
-                    self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
+                    if self.use_tcp:
+                        # Interleaved RTP over RTSP TCP connection: prefix with '$', channel, 16-bit length
+                        frame = b"\x24" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
+                        with self.tcp_write_lock:
+                            try:
+                                self.sock.sendall(frame)
+                            except Exception as e:
+                                print(f"[RTP-TCP] send failed: {e}")
+                                break
+                    else:
+                        self.rtp_sock.sendto(packet, (self.client_ip, self.client_rtp_port))
                 except Exception as e:
                     print(f"[RTP] send failed: {e}")
                     break
