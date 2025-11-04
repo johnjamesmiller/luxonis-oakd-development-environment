@@ -3,7 +3,7 @@ Pure-Python RTSP server
 DepthAI → H.264 → RTP/AVP or RTP/AVP/TCP
 - Full FU-A fragmentation (RFC 6184)
 - Safe for UDP (MTU) and TCP interleaved (!H limit)
-- VLC-tested: vlc rtsp://IP:8554/stream [--rtsp-tcp]
+- TEARDOWN crash fixed
 """
 
 import sys
@@ -102,9 +102,10 @@ class RTSPHandler:
     # ------------------------------------------------------------------
     def _handle_request(self, first_line: str):
         parts = first_line.split()
-        if len(parts) < 3:
+        if len(parts) < 2:                 # ← need at least method + URL
             return
-        method, url, _ = parts
+        method = parts[0]
+        url = parts[1]                     # ← only two values, no third
 
         headers = {}
         while True:
@@ -202,7 +203,7 @@ class RTSPHandler:
 
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind(('', 0))
-        server_rtpeed = self.rtp_sock.getsockname()[1]
+        server_rtp = self.rtp_sock.getsockname()[1]
 
         self.client_ip = self.sock.getpeername()[0]
         self.session = str(int(time.time() * 1000))
@@ -232,7 +233,6 @@ class RTSPHandler:
 
     # ------------------------------------------------------------------
     def _send_rtp_packet(self, packet: bytes):
-        """Send via UDP or TCP interleaved."""
         if self.use_tcp:
             frame = b"$" + bytes([self.rtp_channel]) + struct.pack("!H", len(packet)) + packet
             with self.tcp_write_lock:
@@ -262,11 +262,10 @@ class RTSPHandler:
             if len(nal) == 0:
                 continue
 
-            # Determine max payload size
             max_payload = MAX_TCP_PAYLOAD if self.use_tcp else MAX_UDP_PAYLOAD
-            max_payload -= 14  # RTP header (12) + FU-A header (2)
+            max_payload -= 14                     # RTP header + FU-A header
 
-            # Single NAL Unit Mode (if small)
+            # ---- Single NAL Unit Mode (small) ----
             if len(nal) <= max_payload:
                 marker = 1
                 rtp_hdr = struct.pack(
@@ -279,16 +278,16 @@ class RTSPHandler:
                 )
                 packet = rtp_hdr + nal
                 self._send_rtp_packet(packet)
-                #print(f"[RTP] Single NAL → {len(packet)} B | seq={seq}")
+                print(f"[RTP] Single NAL → {len(packet)} B | seq={seq}")
                 seq = (seq + 1) & 0xFFFF
                 timestamp = (timestamp + inc) & 0xFFFFFFFF
                 continue
 
-            # --- FU-A Fragmentation ---
+            # ---- FU-A Fragmentation ----
             nal_header = nal[0]
-            fu_indicator = (nal_header & 0xE0) | 28  # FU-A
-            fu_header_start = 0x80 | (nal_header & 0x1F)
-            fu_header_end = 0x40 | (nal_header & 0x1F)
+            fu_indicator = (nal_header & 0xE0) | 28          # FU-A
+            fu_header_start = 0x80 | (nal_header & 0x1F)     # S bit
+            fu_header_end   = 0x40 | (nal_header & 0x1F)     # E bit
 
             offset = 1
             first = True
@@ -301,9 +300,10 @@ class RTSPHandler:
                     first = False
                 else:
                     fu_header = nal_header & 0x1F
+
                 marker = 1 if (offset + payload_size) >= len(nal) else 0
                 if marker:
-                    fu_header |= 0x40  # End bit
+                    fu_header |= 0x40
 
                 rtp_hdr = struct.pack(
                     "!BBHII",
@@ -316,7 +316,7 @@ class RTSPHandler:
                 fu_packet = rtp_hdr + bytes([fu_indicator, fu_header]) + payload
                 self._send_rtp_packet(fu_packet)
 
-                print(f"[RTP] FU-A {'S' if fu_header & 0x80 else 'M'}{'E' if marker else ''} → {len(fu_packet)} B | seq={seq}")
+                print(f"[RTP] FU-A {'S' if fu_header & 0x80 else ''}{'E' if marker else ''} → {len(fu_packet)} B | seq={seq}")
 
                 offset += payload_size
                 seq = (seq + 1) & 0xFFFF
