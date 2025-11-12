@@ -1,15 +1,54 @@
 FROM luxonis/depthai-library:latest
 
-RUN alias ll='ls -l'
-RUN apt-get update \
-   && apt-get -y install --no-install-recommends vim \
-   #
-   # Clean up
-   && apt-get autoremove -y \
-   && apt-get clean -y \
-   && rm -rf /var/lib/apt/lists/*
+# -------------------------------------------------
+# 1. Install sudo first (required for non-root user)
+# -------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends sudo && \
+    rm -rf /var/lib/apt/lists/*
 
+# -------------------------------------------------
+# 2. Read host UID/GID/USERNAME from build args
+# -------------------------------------------------
+ARG HOST_UID
+ARG HOST_GID
+ARG HOST_USER
+
+# -------------------------------------------------
+# 3. Create group + user + sudoers file (all as root)
+# -------------------------------------------------
+RUN HOST_UID=${HOST_UID:-1000} \
+    && HOST_GID=${HOST_GID:-1000} \
+    && HOST_USER=${HOST_USER:-devuser} \
+    && groupadd --gid ${HOST_GID} ${HOST_USER} || true \
+    && useradd --uid ${HOST_UID} --gid ${HOST_GID} -m -s /bin/bash ${HOST_USER} \
+    && mkdir -p /etc/sudoers.d \
+    && echo "${HOST_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${HOST_USER} \
+    && chmod 0440 /etc/sudoers.d/${HOST_USER}
+
+# -------------------------------------------------
+# 4. Switch to the non-root user
+# -------------------------------------------------
+USER ${HOST_USER}
+WORKDIR /workspace
+
+# -------------------------------------------------
+# 5. User environment
+# -------------------------------------------------
+RUN echo 'alias ll="ls -l"' >> ~/.bashrc
+
+# -------------------------------------------------
+# 6. Install packages (now sudo works)
+# -------------------------------------------------
+RUN sudo apt-get update && \
+    sudo apt-get -y install --no-install-recommends vim && \
+    sudo apt-get autoremove -y && \
+    sudo apt-get clean -y && \
+    sudo rm -rf /var/lib/apt/lists/*
+
+# -------------------------------------------------
+# 7. Python deps
+# -------------------------------------------------
 COPY requirements.txt ./
-
-RUN pip install --no-cache-dir --upgrade pip \
-  && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --user --upgrade pip && \
+    pip install --no-cache-dir --user -r requirements.txt
