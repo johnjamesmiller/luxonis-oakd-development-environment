@@ -17,10 +17,7 @@
 	"--volume=/mnt/wslg:/mnt/wslg",
 	"--ipc=host"
   ],
-  "mounts": [
-    "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
-  ],
-  "workspaceMount": "source=${localWorkspaceFolder}/src,target=/src,type=bind",
+  "workspaceMount": "source=${localWorkspaceFolder}/,target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "containerEnv": {
     "DISPLAY": "${localEnv:DISPLAY}", // Needed for GUI try ":0" for windows
