@@ -15,6 +15,7 @@
 	"--security-opt=apparmor:unconfined",
 	"--volume=/tmp/.X11-unix:/tmp/.X11-unix",
 	"--volume=/mnt/wslg:/mnt/wslg",
+  "--volume=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh:/root/.ssh-from-host:ro",
 	"--ipc=host"
   ],
   "workspaceMount": "source=${localWorkspaceFolder}/,target=/workspace,type=bind",
@@ -42,5 +43,6 @@
         "zachflower.uncrustify"
       ]
     }
-  }
+  },
+  "postStartCommand": "bash /workspace/.devcontainer/ssh-keys.sh"
 }

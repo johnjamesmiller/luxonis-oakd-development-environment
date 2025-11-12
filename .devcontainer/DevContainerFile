@@ -35,7 +35,7 @@ WORKDIR /workspace
 # -------------------------------------------------
 # 5. User environment
 # -------------------------------------------------
-RUN echo 'alias ll="ls -l"' >> ~/.bashrc
+RUN echo 'alias ll="ls -la"' >> ~/.bashrc
 
 # -------------------------------------------------
 # 6. Install packages (now sudo works)
