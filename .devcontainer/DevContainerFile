@@ -41,7 +41,7 @@ RUN echo 'alias ll="ls -la"' >> ~/.bashrc
 # 6. Install packages (now sudo works)
 # -------------------------------------------------
 RUN sudo apt-get update && \
-    sudo apt-get -y install --no-install-recommends vim && \
+    sudo apt-get -y install --no-install-recommends vim curl ca-certificates && \
     sudo apt-get autoremove -y && \
     sudo apt-get clean -y && \
     sudo rm -rf /var/lib/apt/lists/*
@@ -52,3 +52,7 @@ RUN sudo apt-get update && \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --user --upgrade pip && \
     pip install --no-cache-dir --user -r requirements.txt
+
+
+# Run official Luxonis installer and make sure oaktl is up to date
+RUN bash -c "$(curl -fsSL https://oakctl-releases.luxonis.com/oakctl-installer.sh)" && oakctl self-update || true
