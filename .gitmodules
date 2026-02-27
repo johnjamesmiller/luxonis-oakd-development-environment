@@ -1,0 +1,3 @@
+[submodule "oak-examples"]
+	path = oak-examples
+	url = git@github.com:luxonis/oak-examples.git
